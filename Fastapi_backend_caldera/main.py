@@ -227,8 +227,8 @@ async def websocket_endpoint(ws: WebSocket):
             
             print(f"{ts()} ✅ ESP32 registrado: {esp32_id}")
             await safe_send_json(ws, {"type": "registered", "id": esp32_id})
-            # Avisar a frontends del nuevo dispositivo
-            await broadcast_to_frontends({"type": "esp32_online", "id": esp32_id})
+            # Avisar a frontends del nuevo dispositivo (con IP)
+            await broadcast_to_frontends({"type": "esp32_online", "id": esp32_id, "ip": init_msg.get("ip")})
 
         # --- Lógica de Registro Frontend ---
         elif role == "frontend":
@@ -238,8 +238,16 @@ async def websocket_endpoint(ws: WebSocket):
             }
             print(f"{ts()} ✅ Frontend registrado. Total: {len(frontends)}")
             await safe_send_json(ws, {"type": "registered", "role": "frontend", "ip": peer(ws)})
-            # Enviar lista actual (Snapshot inicial)
-            await safe_send_json(ws, {"type": "esp32_list", "items": sorted(esp32_connections.keys())})
+            # Enviar lista actual como eventos individuales "esp32_online" para que el front sepa IPs
+            for eid, meta in esp32_meta.items():
+                 await safe_send_json(ws, {"type": "esp32_online", "id": eid, "ip": meta.get("ip")})
+            
+            # Enviar última telemetría si existe (para que la app muestre dato de inmediato)
+            sensor_ws = esp32_connections.get("esp32_03") # O buscar por ID de sensor si cambia
+            if sensor_ws and "esp32_03" in esp32_meta:
+                last_telem = esp32_meta["esp32_03"].get("last_telemetry")
+                if last_telem:
+                     await safe_send_json(ws, last_telem)
         
         else:
             await ws.close()
@@ -269,6 +277,18 @@ async def websocket_endpoint(ws: WebSocket):
                 
                 # El ESP32 ya no envía pings según el nuevo modelo. 
                 # Si llegara un ping por error, simplemente lo ignoramos o respondemos pong.
+
+                if m_type == "telemetry":
+                    # Mensaje del SENSOR (ESP32_03)
+                    temp = data.get("temp")
+                    hum = data.get("hum")
+                    # Cacheamos la última temperatura conocida para enviarla a nuevos clientes
+                    if esp32_id: 
+                         esp32_meta[esp32_id]["last_telemetry"] = data
+                    
+                    print(f"{ts()} 🌡️ [SENSOR] {esp32_id}: {temp}°C | {hum}%")
+                    # Retransmitir a TODOS los frontends
+                    await broadcast_to_frontends(data)
 
             # 2. Mensajes desde Frontend
             elif role == "frontend":
