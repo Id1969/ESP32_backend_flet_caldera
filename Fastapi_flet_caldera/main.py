@@ -99,7 +99,8 @@ def main(page: ft.Page):
     target_temp = 21.5
     current_temp = 20.0 
     is_heating = False 
-    master_switch_on = False 
+    master_switch_on = False
+    last_command = None  # Rastrear último comando enviado para evitar spam 
 
     # --- Elementos UI (Súper Básicos) ---
     
@@ -136,6 +137,7 @@ def main(page: ft.Page):
 
     # --- Lógica ---
     def check_logic():
+        nonlocal last_command
         need_heat = False
         if master_switch_on:
             if current_temp < target_temp:
@@ -151,9 +153,15 @@ def main(page: ft.Page):
             lbl_heating.value = "❄️ CALDERA APAGADA"
             lbl_heating.color = ft.Colors.GREY
 
-        # Mandar comando siempre
+        # ⚡ SOLO mandar comando si cambió el estado deseado
         action = "on" if need_heat else "off"
-        page.run_task(ws_client.command_relay, action)
+        if action != last_command:
+            last_command = action
+            print(f"📤 Estado cambió a {action.upper()} - enviando comando")
+            page.run_task(ws_client.command_relay, action)
+        else:
+            # No enviar comando redundante
+            pass
 
     # --- Callback WS ---
     def update_ui(data):
@@ -191,6 +199,7 @@ def main(page: ft.Page):
             lbl_sensor_status.color = ft.Colors.RED
             
             is_heating = False
+            last_command = None  # Resetear para forzar reenvío al reconectar
             page.update()
 
         elif t == "telemetry":
