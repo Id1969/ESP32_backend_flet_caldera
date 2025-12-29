@@ -157,13 +157,40 @@ def main(page: ft.Page):
 
     # --- Callback WS ---
     def update_ui(data):
-        nonlocal current_temp, is_heating
+        nonlocal current_temp, is_heating, master_switch_on
         t = data.get("type")
 
         if t == "registered":
             status_text.value = "✅ Conectado al Servidor"
             status_text.color = ft.Colors.GREEN
+            
+            # ✅ Habilitar el switch ahora que hay conexión
+            sw_master.disabled = False
+            
             page.run_task(ws_client.request_state, RELAY_ID)
+            page.update()
+
+        elif t == "server_disconnected":
+            # 🔴 DESCONEXIÓN DETECTADA - Resetear todo a modo seguro
+            status_text.value = "❌ Desconectado del Servidor"
+            status_text.color = ft.Colors.RED
+            
+            # Forzar apagado visual
+            lbl_heating.value = "❄️ CALDERA APAGADA (Sin conexión)"
+            lbl_heating.color = ft.Colors.GREY
+            
+            # Desactivar termostato automático
+            master_switch_on = False
+            sw_master.value = False
+            
+            # 🔒 DESHABILITAR el switch mientras no hay servidor
+            sw_master.disabled = True
+            
+            # Marcar sonda como desconectada
+            lbl_sensor_status.value = "❌ Sonda Desconectada"
+            lbl_sensor_status.color = ft.Colors.RED
+            
+            is_heating = False
             page.update()
 
         elif t == "telemetry":
