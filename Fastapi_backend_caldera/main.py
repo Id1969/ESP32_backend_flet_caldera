@@ -1,349 +1,229 @@
 """
-Servidor WebSocket (FastAPI) para el control de CALDERAS mediante ESP32 y Relés.
+Servidor WebSocket (FastAPI) para el control de CALDERAS - Arquitectura Centralizada.
 --------------------------------------------------------------------------------------------
+ARQUITECTURA NUEVA:
+    ESP32_02 (RELÉ)   <── WS ──>  BACKEND  <── WS ──>  FRONTEND (App)
+           ^                         ^
+           └──────── WS ─────────────┘
+             ESP32_03 (SENSOR)
 
-ARQUITECTURA
------------
-    FRONTEND(S) (App Flet)  <── WS/WSS ──>  SERVIDOR FASTAPI  <── WS/WSS ──>  ESP32 (Caldera)
+FLUJO DE DATOS:
+1. ESP32_03 -> Backend: {"type": "sensor_update", "temperature": 20.5}
+   -> Backend reenvía a ESP32_02 (para control) y a Frontends (para UI).
 
-OBJETIVO
---------
-- Centralizar la comunicación entre la aplicación del usuario y los nodos ESP32 que activan calderas.
-- El servidor enruta las órdenes de encendido y apagado hacia el ESP32 correcto (usando "id").
-- Difundir el estado de la caldera ("on" / "off") a todos los dispositivos de control conectados.
-- Guardar el último estado conocido para sincronizar la interfaz de usuario nada más abrirla.
+2. Frontend -> Backend: {"type": "config_update", "mode": "AUTO", "target_temp": 22}
+   -> Backend reenvía a ESP32_02.
 
-PROTOCOLO (JSON)
-----------------
-1) Registro ESP32: { "type": "register", "role": "esp32", "id": "esp32_01", ... }
-2) Registro Frontend: { "type": "register", "role": "frontend" }
-3) Comando: { "type":"command", "to":"esp32_01", "device":"relay", "action":"on" }
-4) Estado: { "type":"state", "from":"esp32_01", "device":"relay", "state":"on", ... }
-
-NOTAS DE FUNCIONAMIENTO
------------------------
-- El servidor actúa como un túnel bidireccional en tiempo real.
-- Incorpora un sistema de "Vigilante" (Keep-Alive) que detecta desconexiones de la caldera para avisar al usuario.
-- Diseñado para ser desplegado en plataformas como Render.
+3. ESP32_02 -> Backend: {"type": "status_update", "relay_state": "ON", ...}
+   -> Backend actualiza ESTADO GLOBAL y difunde a Frontends.
 """
 
-
 from __future__ import annotations
-
 import asyncio
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set, Tuple
-
+import json 
+from datetime import datetime
+from typing import Any, Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-
 # --------------------------------------------------------------------------
-# 🕒 Timestamp ISO (UTC) tipo ESP32: 2025-12-22T18:01:33Z
+# 🕒 Timestamp
 # --------------------------------------------------------------------------
 def ts() -> str:
-    # Usamos la hora local del sistema para mayor claridad en los logs del usuario
     return datetime.now().strftime("%H:%M:%S")
 
-
 # --------------------------------------------------------------------------
-# 🧩 Helper para identificar conexiones en logs
-# --------------------------------------------------------------------------
-def peer(ws: WebSocket) -> str:
-    try:
-        c = ws.client
-        if c:
-            return f"{c.host}:{c.port}"
-    except Exception:
-        pass
-    return "unknown"
-
-
-# --------------------------------------------------------------------------
-# 🔧 APP FASTAPI + CORS
+# 🔧 APP FASTAPI
 # --------------------------------------------------------------------------
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # En producción puedes restringir dominios
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --------------------------------------------------------------------------
+# 🧠 ESTADO GLOBAL DEL SISTEMA
+# --------------------------------------------------------------------------
+global_state = {
+    "mode": "MANUAL",        
+    "relay_state": "OFF",    
+    "current_temp": None,    
+    "target_temp": 21.5,     
+    "last_update": 0
+}
+
+# Conexiones activas
+connections: Dict[str, WebSocket] = {}  # "esp32_02", "esp32_03"
+frontends: Dict[WebSocket, str] = {}    # ws -> ip
 
 # --------------------------------------------------------------------------
-# 🧠 ESTRUCTURAS DE ESTADO EN MEMORIA
-# --------------------------------------------------------------------------
-
-esp32_connections: Dict[str, WebSocket] = {}
-esp32_meta: Dict[str, Dict[str, Any]] = {}
-frontends: Dict[WebSocket, Dict[str, Any]] = {}  # Ahora es un dict para guardar meta-data
-state_cache: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
-
-
-# --------------------------------------------------------------------------
-# 🏠 RUTA DE ESTADO (Health Check)
-# --------------------------------------------------------------------------
-@app.get("/")
-async def get_status():
-    frontend_ips = [info.get("ip", "unknown") for info in frontends.values()]
-    return {
-        "status": "online",
-        "esp32_conectados": list(esp32_connections.keys()),
-        "total_frontends": len(frontends),
-        "frontends_active_ips": frontend_ips,
-        "cache_estados": len(state_cache),
-        "timestamp": ts(),
-    }
-
-
-# --------------------------------------------------------------------------
-# 📡 UTILIDADES DE ENVÍO SEGURO Y CACHÉ
+# 📡 UTILIDADES
 # --------------------------------------------------------------------------
 async def safe_send_json(ws: WebSocket, payload: Dict[str, Any]) -> bool:
-    """Envía JSON y devuelve False si la conexión está muerta."""
     try:
         await ws.send_json(payload)
         return True
     except Exception:
         return False
 
-async def broadcast_to_frontends(payload: Dict[str, Any]) -> None:
-    """Difunde a todos los frontends registrados. Si uno falla, se purga."""
-    dead = []
+async def broadcast_state() -> None:
+    """Envía el estado completo a todos los frontends conectados."""
+    payload = {
+        "type": "full_state_update",
+        "connection_status": {
+            "esp32_02": "connected" if "esp32_02" in connections else "disconnected",
+            "esp32_03": "connected" if "esp32_03" in connections else "disconnected"
+        },
+        "system_state": global_state,
+        "timestamp": ts()
+    }
+    
+    dead_fronts = []
     for ws in list(frontends.keys()):
         if not await safe_send_json(ws, payload):
-            dead.append(ws)
-
-    for ws in dead:
+            dead_fronts.append(ws)
+    
+    for ws in dead_fronts:
         if ws in frontends:
             del frontends[ws]
-            print(f"{ts()} 🧹 Frontend eliminado (broadcast falló) peer={peer(ws)}")
-
-def cache_state(payload: Dict[str, Any]) -> None:
-    """Guarda el último estado conocido por (esp32_id, device, channel)."""
-    esp32_id = payload.get("from")
-    device = payload.get("device")
-    dev_id = payload.get("id")
-
-    if isinstance(esp32_id, str) and isinstance(device, str) and isinstance(dev_id, int):
-        state_cache[(esp32_id, device, dev_id)] = payload
-
-def get_cached_state_for_esp32(esp32_id: str) -> Optional[Dict[str, Any]]:
-    """Devuelve el estado guardado del relé 0 para un ESP32."""
-    key = (esp32_id, "relay", 0)
-    return state_cache.get(key)
-
 
 # --------------------------------------------------------------------------
-# ❤️ KEEP-ALIVE (Vigilante Activo)
+# ❤️ KEEP-ALIVE & LIMPIEZA
 # --------------------------------------------------------------------------
-KEEP_ALIVE_SECONDS = 15  # Cada 15s revisamos salud
-
-async def keep_alive_task() -> None:
-    """Tarea continua que barre conexiones muertas para liberar RAM y avisar al front."""
+async def keep_alive_task():
     while True:
-        await asyncio.sleep(KEEP_ALIVE_SECONDS)
-        now = time.time()
-        
-        # 1. Vigilar Frontends (Purga por fallo de comunicación o inactividad extrema de 24h)
-        dead_fronts = []
-        for ws, info in list(frontends.items()):
-            # Solo purgamos por inactividad si pasan 24 horas sin señales (por seguridad extrema)
-            if now - info.get("last_seen", 0) > 86400:
-                dead_fronts.append(ws)
-                continue
-
-            # El intento de envío detectará si la pestaña se cerró
-            if not await safe_send_json(ws, {"type": "ping"}):
-                dead_fronts.append(ws)
-        
-        for ws in dead_fronts:
-            if ws in frontends:
-                del frontends[ws]
-                print(f"{ts()} 🧹 Limpieza: Frontend 'zombi' eliminado (peer={peer(ws)})")
-
-        # 2. Vigilar ESP32s (Solo purga si el socket se rompe)
+        await asyncio.sleep(15)
+        # 1. Purgar conexiones ESP32 muertas
         dead_esps = []
-        for eid, ws in list(esp32_connections.items()):
-            # Solo eliminamos si el envío falla físicamente
+        for cid, ws in list(connections.items()):
             if not await safe_send_json(ws, {"type": "ping"}):
-                dead_esps.append(eid)
+                dead_esps.append(cid)
         
-        for eid in dead_esps:
-            esp32_connections.pop(eid, None)
-            esp32_meta.pop(eid, None)   # También limpiamos sus metadatos
-            print(f"{ts()} 🧹 Limpieza: ESP32 'zombi' eliminado ({eid})")
-            await broadcast_to_frontends({"type": "esp32_offline", "id": eid})
+        for cid in dead_esps:
+            print(f"{ts()} 🧹 ESP32 Caído: {cid}")
+            # FIX: Verificar si existe antes de borrar para evitar KeyError (Race Condition)
+            if cid in connections:
+                del connections[cid]
+                # FIX: Si se cae el Relé, forzar estado OFF en la verdad global
+                if cid == "esp32_02":
+                    global_state["relay_state"] = "OFF"
+                await broadcast_state() 
 
+        # 2. Purgar Frontends muertos
+        dead_fronts = []
+        for ws in list(frontends.keys()):
+             if not await safe_send_json(ws, {"type": "ping"}):
+                dead_fronts.append(ws)
+        for ws in dead_fronts:
+            if ws in frontends: del frontends[ws]
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(keep_alive_task())
-    print(f"{ts()} 🚀 Vigilante Activo: Iniciado (escaneo cada {KEEP_ALIVE_SECONDS}s)")
-
+    print(f"{ts()} 🚀 Servidor Iniciado (Modo Centralizado + DEBUG)")
 
 # --------------------------------------------------------------------------
-# 📡 ENDPOINT WEBSOCKET
+# 🔌 WEBSOCKET ENDPOINT
 # --------------------------------------------------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    print(f"{ts()} 🔌 Nueva conexión WebSocket peer={peer(ws)}")
-
+    client_id: Optional[str] = None
     role: Optional[str] = None
-    esp32_id: Optional[str] = None
-
+    
     try:
-        # Esperar mensaje de registro inicial
-        init_msg = await ws.receive_json()
-
-        if init_msg.get("type") != "register":
-            await ws.send_json({"type": "error", "message": "Se esperaba register"})
+        # 1. Handshake Inicial
+        try:
+            init_data = await ws.receive_text()
+            init_msg = json.loads(init_data)
+        except Exception as e:
+            print(f"{ts()} ❌ Error General WS: {e}")
             await ws.close()
             return
-
+            
         role = init_msg.get("role")
-        
-        # --- Lógica de Registro ESP32 ---
-        if role == "esp32":
-            esp32_id = init_msg.get("id")
-            if not esp32_id:
-                await ws.close()
-                return
+        client_id = init_msg.get("id") 
 
-            # Simplemente actualizar el registro sin cerrar manualmente la anterior
-            # (FastAPI/Uvicorn ya gestionan el cierre de sockets huérfanos)
-            esp32_connections[esp32_id] = ws
-            esp32_meta[esp32_id] = {
-                "mac": init_msg.get("mac"),
-                "ip": init_msg.get("ip"),
-                "last_seen": time.time(),
-            }
-            
-            print(f"{ts()} ✅ ESP32 registrado: {esp32_id}")
-            await safe_send_json(ws, {"type": "registered", "id": esp32_id})
-            # Avisar a frontends del nuevo dispositivo (con IP)
-            await broadcast_to_frontends({"type": "esp32_online", "id": esp32_id, "ip": init_msg.get("ip")})
+        if role == "esp32" and client_id:
+            connections[client_id] = ws
+            print(f"{ts()} ✅ ESP32 Conectado: {client_id}")
+            await ws.send_json({"type": "registered", "id": client_id})
+            await broadcast_state() 
 
-        # --- Lógica de Registro Frontend ---
         elif role == "frontend":
-            frontends[ws] = {
-                "ip": peer(ws),
-                "last_seen": time.time()
-            }
-            print(f"{ts()} ✅ Frontend registrado. Total: {len(frontends)}")
-            await safe_send_json(ws, {"type": "registered", "role": "frontend", "ip": peer(ws)})
-            # Enviar lista actual como eventos individuales "esp32_online" para que el front sepa IPs
-            for eid, meta in esp32_meta.items():
-                 await safe_send_json(ws, {"type": "esp32_online", "id": eid, "ip": meta.get("ip")})
-            
-            # Enviar última telemetría si existe (para que la app muestre dato de inmediato)
-            sensor_ws = esp32_connections.get("esp32_03") # O buscar por ID de sensor si cambia
-            if sensor_ws and "esp32_03" in esp32_meta:
-                last_telem = esp32_meta["esp32_03"].get("last_telemetry")
-                if last_telem:
-                     await safe_send_json(ws, last_telem)
-        
+            frontends[ws] = ws.client.host if ws.client else "unknown"
+            print(f"{ts()} 👤 Frontend Conectado: {frontends[ws]}")
+            await ws.send_json({"type": "registered"})
+            await broadcast_state() 
+
         else:
+            print(f"⚠️ Rol desconocido o falta ID: {init_msg}")
             await ws.close()
             return
 
-        # --- Bucle de Escucha de Mensajes ---
+        # 2. Bucle principal
         while True:
-            # Actualizar last_seen en cada mensaje recibido (para el vigilante)
-            if role == "frontend" and ws in frontends:
-                frontends[ws]["last_seen"] = time.time()
-            elif role == "esp32" and esp32_id:
-                esp32_meta[esp32_id]["last_seen"] = time.time()
+            try:
+                raw_data = await ws.receive_text()
+                # print(f"{ts()} [DEBUG] RAW Loop: {raw_data}") 
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                print(f"{ts()} ❌ JSON roto en bucle")
+                continue
 
-            data = await ws.receive_json()
-            m_type = data.get("type")
+            msg_type = data.get("type")
 
-            # 1. Mensajes desde ESP32
-            if role == "esp32":
-                if m_type == "state":
-                    cache_state(data)
-                    device = data.get("device", "unknown")
-                    state = data.get("state", "unknown")
-                    # Recuperamos quién fue el último que mandó una orden a esta placa
-                    triggered_by = esp32_meta.get(esp32_id, {}).get("last_commander", "vía interruptor físico")
-                    print(f"{ts()} 📢 [ESTADO] {esp32_id} -> {device}: {state.upper()} (Sincronizado con: {triggered_by})")
-                    await broadcast_to_frontends(data)
+            # --- CASO 1: LLEGA DATO DEL SENSOR (ESP32_03) ---
+            if client_id == "esp32_03" and msg_type == "sensor_update":
+                temp = data.get("temperature")
+                print(f"{ts()} 🌡️ Sonda: {temp}°C")
+                global_state["current_temp"] = temp 
                 
-                # El ESP32 ya no envía pings según el nuevo modelo. 
-                # Si llegara un ping por error, simplemente lo ignoramos o respondemos pong.
+                if "esp32_02" in connections:
+                    await safe_send_json(connections["esp32_02"], data)
+                
+                await broadcast_state()
 
-                if m_type == "telemetry":
-                    # Mensaje del SENSOR (ESP32_03)
-                    temp = data.get("temp")
-                    hum = data.get("hum")
-                    # Cacheamos la última temperatura conocida para enviarla a nuevos clientes
-                    if esp32_id: 
-                         esp32_meta[esp32_id]["last_telemetry"] = data
-                    
-                    print(f"{ts()} 🌡️ [SENSOR] {esp32_id}: {temp}°C | {hum}%")
-                    # Retransmitir a TODOS los frontends
-                    await broadcast_to_frontends(data)
+            # --- CASO 2: LLEGA STATUS DEL RELÉ (ESP32_02) ---
+            elif client_id == "esp32_02" and msg_type == "status_update":
+                global_state["mode"] = data.get("mode", global_state["mode"])
+                global_state["relay_state"] = data.get("relay_state", "OFF")
+                global_state["target_temp"] = data.get("target_temp", global_state["target_temp"])
+                global_state["last_update"] = time.time()
+                
+                # print(f"{ts()} 📢 Relé Update") 
+                await broadcast_state()
 
-            # 2. Mensajes desde Frontend
-            elif role == "frontend":
-                if m_type == "command":
-                    target_id = data.get("to")
-                    action = data.get("action", "unknown").upper()
-                    client_ip = peer(ws)
-                    print(f"{ts()} 🎮 [COMANDO] Desde: {client_ip} -> Para: {target_id} -> Acción: {action}")
-                    
-                    # Guardamos en los metadatos de la placa quién le está mandando la orden
-                    if target_id in esp32_meta:
-                        esp32_meta[target_id]["last_commander"] = client_ip
-                    
-                    target_ws = esp32_connections.get(target_id)
-                    if target_ws:
-                        ok = await safe_send_json(target_ws, data)
-                        if not ok:
-                            # Purga por fallo: el ESP32 no respondió al envío
-                            del esp32_connections[target_id]
-                            await broadcast_to_frontends({"type": "esp32_offline", "id": target_id})
-                    else:
-                        # Si no está en el dict, avisamos al front que está offline
-                        await safe_send_json(ws, {"type": "esp32_offline", "id": target_id})
+            # --- CASO 3: COMANDO DESDE FRONTEND ---
+            elif role == "frontend" and msg_type == "config_update":
+                print(f"{ts()} 🎮 Comando Usuario: {data}")
+                if "esp32_02" in connections:
+                    await safe_send_json(connections["esp32_02"], data)
+                else:
+                    print(f"{ts()} ⚠ Comando ignorado: ESP32_02 desconectado")
 
-                elif m_type == "get_state":
-                    target_id = data.get("to")
-                    cached = get_cached_state_for_esp32(target_id)
-                    if cached:
-                        await safe_send_json(ws, cached)
-                    else:
-                        # Si no hay cache, se lo pedimos al ESP32 (si existe)
-                        tw = esp32_connections.get(target_id)
-                        if tw:
-                            await safe_send_json(tw, {"type": "get_state"})
+            # --- CASO 4: PING ---
+            elif msg_type == "ping":
+                await ws.send_json({"type": "pong"})
 
     except WebSocketDisconnect:
-        print(f"{ts()} 🔌 Desconexión limpia (WebSocketDisconnect) role={role} id={esp32_id}")
+        print(f"{ts()} 🔌 Desconectado: {client_id or 'Frontend'}")
     except Exception as e:
-        print(f"{ts()} ⚠ Error en bucle WS: {e} role={role} id={esp32_id}")
+        print(f"{ts()} ❌ Error General WS: {e}")
     finally:
-        # Limpieza al desconectar
-        if role == "frontend":
-            if ws in frontends:
-                del frontends[ws]
-            print(f"{ts()} 🧹 Frontend desconectado")
-        
-        if role == "esp32" and esp32_id:
-            if esp32_connections.get(esp32_id) == ws:
-                del esp32_connections[esp32_id]
-                print(f"{ts()} 🧹 ESP32 desconectado: {esp32_id}")
-                await broadcast_to_frontends({"type": "esp32_offline", "id": esp32_id})
+        if role == "esp32" and client_id in connections:
+            del connections[client_id]
+            # FIX: Asegurar estado OFF visual si se desconecta
+            if client_id == "esp32_02":
+                global_state["relay_state"] = "OFF"
+            await broadcast_state()
+        elif role == "frontend" and ws in frontends:
+            del frontends[ws]
 
-
-# --------------------------------------------------------------------------
-# 🏁 EJECUCIÓN LOCAL
-# --------------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

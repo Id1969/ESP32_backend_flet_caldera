@@ -1,6 +1,6 @@
 """
 ===========================================================================================
- PROYECTO: Termostato Inteligente WiFi (App Flet - VERSIÓN SIMPLIFICADA)
+ PROYECTO: Termostato Inteligente WiFi (App Flet - MODO CENTRALIZADO)
 ===========================================================================================
 """
 
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 import os
 from typing import Callable, Optional
 
@@ -25,11 +24,6 @@ WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
 
 if not WEBSOCKET_URL:
     raise ValueError("⚠️ ERROR: La variable WEBSOCKET_URL no está definida en .env")
-
-# IDs de Dispositivos (Hardcoded)
-RELAY_ID = "esp32_02"
-SENSOR_ID = "esp32_03"
-
 
 # ===============================================================================
 # 🧠 CLIENTE WEBSOCKET
@@ -48,7 +42,7 @@ class WebSocketClient:
                 print(f"❌ Error WS: {e}")
             finally:
                 self.websocket = None
-                self.ui_callback({"type": "server_disconnected"})
+                self.ui_callback({"type": "disconnected"}) # Aviso interno
                 await asyncio.sleep(5)
 
     async def _connect_once(self):
@@ -60,9 +54,12 @@ class WebSocketClient:
             await self.send_json({"type": "register", "role": "frontend"})
             
             async for message in ws:
-                data = json.loads(message)
-                if isinstance(data, dict):
-                    self.ui_callback(data)
+                try:
+                    data = json.loads(message)
+                    if isinstance(data, dict):
+                        self.ui_callback(data)
+                except json.JSONDecodeError:
+                    pass
 
     async def send_json(self, payload: dict):
         if self.websocket:
@@ -71,174 +68,217 @@ class WebSocketClient:
             except Exception:
                 self.websocket = None
 
-    async def request_state(self, esp32_id: str):
-        await self.send_json({"type": "get_state", "to": esp32_id})
-
-    async def command_relay(self, action: str):
-        print(f"🕹️ Enviando {action.upper()} a {RELAY_ID}")
+    async def send_config_update(self, mode: str, target_temp: float):
+        """Envía la nueva configuración deseada por el usuario"""
+        print(f"📤 Enviando Config: {mode} | {target_temp}°C")
         await self.send_json({
-            "type": "command",
-            "to": RELAY_ID,
-            "device": "relay",
-            "id": 0,
-            "action": action,
+            "type": "config_update",
+            "mode": mode,         # "AUTO" | "MANUAL"
+            "target_temp": target_temp
         })
 
-
 # ===============================================================================
-# 🖥️ INTERFAZ DE TERMOSTATO (SIMPLIFICADA)
+# 🖥️ INTERFAZ DE TERMOSTATO (VISOR CENTRALIZADO)
 # ===============================================================================
 def main(page: ft.Page):
-    page.title = "Termostato Sencillo"
+    page.title = "Control Caldera Pro"
     page.theme_mode = ft.ThemeMode.DARK
-    page.bgcolor = ft.Colors.BLACK
-    page.vertical_alignment = ft.MainAxisAlignment.START
-    page.padding = 20
-    
-    # --- Estado Local ---
-    target_temp = 21.5
-    current_temp = 20.0 
-    is_heating = False 
-    master_switch_on = False
-    last_command = None  # Rastrear último comando enviado para evitar spam 
+    page.bgcolor = "#1a1a1a"
+    page.padding = 30
+    page.vertical_alignment = ft.MainAxisAlignment.CENTER
+    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
 
-    # --- Elementos UI (Súper Básicos) ---
+    # --- Estado Local (Solo para UI, la verdad absoluta viene del Backend) ---
+    current_mode = "MANUAL"
+    current_target = 21.5
     
-    status_text = ft.Text("Estado: Desconectado", color=ft.Colors.RED)
+    # --- Componentes UI ---
     
-    lbl_target = ft.Text("Temperatura OBJETIVO:", size=20, color=ft.Colors.GREY)
-    txt_target = ft.Text(f"{target_temp:.1f}°C", size=60, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE)
+    # 1. Indicador de Conexión (Backend)
+    status_icon = ft.Icon(ft.Icons.WIFI_OFF, color=ft.Colors.RED, size=30)
+    status_text = ft.Text("Desconectado", color=ft.Colors.RED, weight=ft.FontWeight.BOLD)
     
+    # 2. Indicadores Dispositivos
+    led_relay = ft.Icon(ft.Icons.CIRCLE, color=ft.Colors.GREY, size=15)
+    lbl_relay = ft.Text("Relé: ?", color=ft.Colors.GREY)
+    
+    led_sensor = ft.Icon(ft.Icons.CIRCLE, color=ft.Colors.GREY, size=15)
+    lbl_sensor = ft.Text("Sonda: ?", color=ft.Colors.GREY)
+
+    # 3. Temperatura Actual (Grande)
+    txt_current_temp = ft.Text("--.-°C", size=70, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE)
+    lbl_current_desc = ft.Text("Temperatura Actual", size=16, color=ft.Colors.GREY)
+
+    # 4. Control de Temperatura Objetivo
+    txt_target_temp = ft.Text(f"{current_target}°C", size=40, weight=ft.FontWeight.W_500, color=ft.Colors.CYAN)
+    
+    # FIX: Async Helper para run_task
+    async def send_config_helper():
+        await ws_client.send_config_update(current_mode, current_target)
+
     def change_target(e, delta):
-        nonlocal target_temp
-        target_temp = round(target_temp + delta, 1)
-        txt_target.value = f"{target_temp:.1f}°C"
-        check_logic()
+        nonlocal current_target
+        current_target = round(current_target + delta, 1)
+        txt_target_temp.value = f"{current_target}°C"
+        # Enviar comando usando el helper async
+        page.run_task(send_config_helper)
         page.update()
 
-    btn_plus = ft.ElevatedButton("+", on_click=lambda e: change_target(e, 0.5))
-    btn_minus = ft.ElevatedButton("-", on_click=lambda e: change_target(e, -0.5))
+    btn_minus = ft.IconButton(ft.Icons.REMOVE, on_click=lambda e: change_target(e, -0.5), icon_color=ft.Colors.CYAN, icon_size=40)
+    btn_plus = ft.IconButton(ft.Icons.ADD, on_click=lambda e: change_target(e, 0.5), icon_color=ft.Colors.CYAN, icon_size=40)
 
-    lbl_current = ft.Text("Temperatura ACTUAL (Sonda):", size=20, color=ft.Colors.GREY)
-    txt_current = ft.Text(f"{current_temp:.1f}°C", size=40, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE)
-    
-    lbl_sensor_status = ft.Text("Sonda: Buscando...", color=ft.Colors.GREY, size=14) # Nuevo indicador
-    
-    lbl_heating = ft.Text("CALDERA APAGADA", size=30, weight=ft.FontWeight.BOLD, color=ft.Colors.GREY)
-
-    def on_master(e):
-        nonlocal master_switch_on
-        master_switch_on = e.control.value
-        check_logic()
+    # 5. Modo de Operación
+    def toggle_mode(e):
+        nonlocal current_mode
+        current_mode = "AUTO" if e.control.value else "MANUAL"
+        page.run_task(send_config_helper)
         page.update()
 
-    sw_master = ft.Switch(label="Activar Termostato Automático", value=False, on_change=on_master)
+    sw_mode = ft.Switch(label="Modo Automático", value=False, on_change=toggle_mode, active_color=ft.Colors.GREEN)
+    
+    # 6. Estado de la Caldera (Visual)
+    card_status = ft.Container(
+        content=ft.Text("APAGADA", size=20, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+        bgcolor=ft.Colors.GREY,
+        padding=10,
+        border_radius=10,
+        alignment=ft.alignment.center
+    )
 
-
-    # --- Lógica ---
-    def check_logic():
-        nonlocal last_command
-        need_heat = False
-        if master_switch_on:
-            if current_temp < target_temp:
-                need_heat = True
-            elif current_temp >= target_temp:
-                need_heat = False
-        
-        # Actualizar Visual
-        if need_heat:
-            lbl_heating.value = "🔥 CALDERA ENCENDIDA"
-            lbl_heating.color = ft.Colors.ORANGE
-        else:
-            lbl_heating.value = "❄️ CALDERA APAGADA"
-            lbl_heating.color = ft.Colors.GREY
-
-        # ⚡ SOLO mandar comando si cambió el estado deseado
-        action = "on" if need_heat else "off"
-        if action != last_command:
-            last_command = action
-            print(f"📤 Estado cambió a {action.upper()} - enviando comando")
-            page.run_task(ws_client.command_relay, action)
-        else:
-            # No enviar comando redundante
-            pass
-
-    # --- Callback WS ---
+    # --- Lógica de Actualización UI ---
     def update_ui(data):
-        nonlocal current_temp, is_heating, master_switch_on
+        nonlocal current_mode, current_target
         t = data.get("type")
 
+        # A) Conexión / Desconexión Backend
         if t == "registered":
-            status_text.value = "✅ Conectado al Servidor"
+            status_icon.name = ft.Icons.WIFI
+            status_icon.color = ft.Colors.GREEN
+            status_text.value = "Conectado"
             status_text.color = ft.Colors.GREEN
             
-            # ✅ Habilitar el switch ahora que hay conexión
-            sw_master.disabled = False
-            
-            page.run_task(ws_client.request_state, RELAY_ID)
+            # Reactivar controles de forma segura
+            sw_mode.disabled = False
+            btn_plus.disabled = False
+            btn_minus.disabled = False
             page.update()
-
-        elif t == "server_disconnected":
-            # 🔴 DESCONEXIÓN DETECTADA - Resetear todo a modo seguro
-            status_text.value = "❌ Desconectado del Servidor"
+        
+        elif t == "disconnected":
+            status_icon.name = ft.Icons.WIFI_OFF
+            status_icon.color = ft.Colors.RED
+            status_text.value = "Desconectado"
             status_text.color = ft.Colors.RED
             
-            # Forzar apagado visual
-            lbl_heating.value = "❄️ CALDERA APAGADA (Sin conexión)"
-            lbl_heating.color = ft.Colors.GREY
-            
-            # Desactivar termostato automático
-            master_switch_on = False
-            sw_master.value = False
-            
-            # 🔒 DESHABILITAR el switch mientras no hay servidor
-            sw_master.disabled = True
-            
-            # Marcar sonda como desconectada
-            lbl_sensor_status.value = "❌ Sonda Desconectada"
-            lbl_sensor_status.color = ft.Colors.RED
-            
-            is_heating = False
-            last_command = None  # Resetear para forzar reenvío al reconectar
-            page.update()
+            # Desactivar controles para evitar confusión
+            sw_mode.disabled = True
+            btn_plus.disabled = True
+            btn_minus.disabled = True
 
-        elif t == "telemetry":
-            val = data.get("temp")
-            if val is not None:
-                current_temp = float(val)
-                txt_current.value = f"{current_temp:.1f}°C"
-                lbl_sensor_status.value = "✅ Sonda Conectada (Recibiendo datos)"
-                lbl_sensor_status.color = ft.Colors.GREEN
-                check_logic()
-                page.update()
-        
-        elif t == "esp32_offline" and data.get("id") == SENSOR_ID:
-            lbl_sensor_status.value = "❌ Sonda Desconectada"
-            lbl_sensor_status.color = ft.Colors.RED
+            # Resetear visuales a estado seguro
+            card_status.bgcolor = ft.Colors.GREY
+            card_status.content.value = "SIN CONEXIÓN"
+            led_relay.color = ft.Colors.RED
+            led_sensor.color = ft.Colors.RED
             page.update()
+            return
+
+        # B) Estado Completo (Sonda, Relé, Config)
+        if t == "full_state_update" or t == "status_update" or t == "sensor_update":
             
-        elif t == "state" and data.get("from") == RELAY_ID:
-            st = data.get("state")
-            is_heating = (st == "on")
-            # Podríamos actualizar el visual aquí también para confirmar
+            conn = data.get("connection_status", {})
+            sys_state = data.get("system_state", {})
+            
+            # Si es un update parcial directo
+            if not sys_state and (t == "status_update"): 
+                sys_state = data
+            
+            # Si es update de sensor directo
+            if t == "sensor_update":
+                sys_state["current_temp"] = data.get("temperature")
+            
+            # 1. Conectividad Dispositivos
+            if conn:
+                r_ok = conn.get("esp32_02") == "connected"
+                s_ok = conn.get("esp32_03") == "connected"
+                
+                led_relay.color = ft.Colors.GREEN if r_ok else ft.Colors.RED
+                lbl_relay.value = "Relé: OK" if r_ok else "Relé: OFF"
+                
+                led_sensor.color = ft.Colors.GREEN if s_ok else ft.Colors.RED
+                lbl_sensor.value = "Sonda: OK" if s_ok else "Sonda: OFF"
+
+            # 2. Valores del Sistema
+            mode = sys_state.get("mode")
+            relay_on = sys_state.get("relay_state") == "ON"
+            curr = sys_state.get("current_temp")
+            tgt = sys_state.get("target_temp")
+
+            if mode:
+                if mode != current_mode:
+                    current_mode = mode
+                    sw_mode.value = (mode == "AUTO")
+            
+            if tgt:
+                tgt_val = float(tgt)
+                if abs(tgt_val - current_target) > 0.1:
+                    current_target = tgt_val
+                    txt_target_temp.value = f"{current_target}°C"
+
+            if curr is not None:
+                txt_current_temp.value = f"{float(curr):.1f}°C"
+                txt_current_temp.color = ft.Colors.WHITE
+            else:
+                txt_current_temp.value = "--.-°C"
+                txt_current_temp.color = ft.Colors.GREY
+
+            # 3. Estado Visual Caldera
+            if relay_on:
+                card_status.bgcolor = ft.Colors.ORANGE_900
+                card_status.content.value = "🔥 CALENTANDO"
+                card_status.content.color = ft.Colors.ORANGE
+                card_status.border = ft.border.all(2, ft.Colors.ORANGE)
+            else:
+                card_status.bgcolor = ft.Colors.GREY_900
+                card_status.content.value = "❄️ EN REPOSO"
+                card_status.content.color = ft.Colors.GREY
+                card_status.border = None
+
             page.update()
 
     ws_client = WebSocketClient(update_ui)
 
-    # --- Layout Simple (Columna sin misterios) ---
+    # --- Layout ---
     page.add(
-        status_text,
+        ft.Row([status_icon, status_text], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([
+            ft.Row([led_relay, lbl_relay]),
+            ft.Container(width=20),
+            ft.Row([led_sensor, lbl_sensor])
+        ], alignment=ft.MainAxisAlignment.CENTER),
+        
         ft.Divider(),
-        lbl_target,
-        ft.Row([btn_minus, txt_target, btn_plus], alignment=ft.MainAxisAlignment.CENTER),
-        ft.Divider(),
-        lbl_current,
-        txt_current,
-        lbl_sensor_status,
-        ft.Divider(),
-        sw_master,
-        ft.Divider(),
-        lbl_heating
+        
+        ft.Column([
+            txt_current_temp,
+            lbl_current_desc
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        
+        ft.Divider(height=40, color=ft.Colors.TRANSPARENT),
+        
+        ft.Text("TEMPERATURA OBJETIVO", color=ft.Colors.CYAN, size=12),
+        ft.Row([
+            btn_minus,
+            txt_target_temp,
+            btn_plus
+        ], alignment=ft.MainAxisAlignment.CENTER),
+        
+        ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
+        
+        sw_mode,
+        
+        ft.Divider(height=40, color=ft.Colors.TRANSPARENT),
+        
+        card_status
     )
 
     page.run_task(ws_client.connect_forever)
