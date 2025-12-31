@@ -82,6 +82,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     if (!error) {
       const char *msgType = doc["type"];
       if (msgType && strcmp(msgType, "ping") == 0) {
+        Serial.println("🏓 PING recibido del Backend"); // Heartbeat explícito
         webSocket.sendTXT("{\"type\":\"pong\"}");
       }
     }

@@ -156,11 +156,6 @@ def main(page: ft.Page):
             status_icon.color = ft.Colors.GREEN
             status_text.value = "Conectado"
             status_text.color = ft.Colors.GREEN
-            
-            # Reactivar controles de forma segura
-            sw_mode.disabled = False
-            btn_plus.disabled = False
-            btn_minus.disabled = False
             page.update()
         
         elif t == "disconnected":
@@ -169,12 +164,12 @@ def main(page: ft.Page):
             status_text.value = "Desconectado"
             status_text.color = ft.Colors.RED
             
-            # Desactivar controles para evitar confusión
+            # Desactivar controles
             sw_mode.disabled = True
             btn_plus.disabled = True
             btn_minus.disabled = True
 
-            # Resetear visuales a estado seguro
+            # Estado visual seguro
             card_status.bgcolor = ft.Colors.GREY
             card_status.content.value = "SIN CONEXIÓN"
             led_relay.color = ft.Colors.RED
@@ -182,38 +177,53 @@ def main(page: ft.Page):
             page.update()
             return
 
-        # B) Estado Completo (Sonda, Relé, Config)
+        # B) Estado Completo
         if t == "full_state_update" or t == "status_update" or t == "sensor_update":
-            
             conn = data.get("connection_status", {})
             sys_state = data.get("system_state", {})
             
-            # Si es un update parcial directo
-            if not sys_state and (t == "status_update"): 
-                sys_state = data
+            # Parches para actualizaciones parciales
+            if not sys_state and (t == "status_update"): sys_state = data
+            if t == "sensor_update": sys_state["current_temp"] = data.get("temperature")
             
-            # Si es update de sensor directo
-            if t == "sensor_update":
-                sys_state["current_temp"] = data.get("temperature")
-            
-            # 1. Conectividad Dispositivos
+            # 1. Conectividad
+            # IMPORTANTE: Bloqueo de UI si falta el Relé
+            relay_connected = False
             if conn:
-                r_ok = conn.get("esp32_02") == "connected"
-                s_ok = conn.get("esp32_03") == "connected"
+                relay_connected = (conn.get("esp32_02") == "connected")
+                sensor_connected = (conn.get("esp32_03") == "connected")
                 
-                led_relay.color = ft.Colors.GREEN if r_ok else ft.Colors.RED
-                lbl_relay.value = "Relé: OK" if r_ok else "Relé: OFF"
+                led_relay.color = ft.Colors.GREEN if relay_connected else ft.Colors.RED
+                lbl_relay.value = "Relé: OK" if relay_connected else "Relé: OFF"
                 
-                led_sensor.color = ft.Colors.GREEN if s_ok else ft.Colors.RED
-                lbl_sensor.value = "Sonda: OK" if s_ok else "Sonda: OFF"
+                led_sensor.color = ft.Colors.GREEN if sensor_connected else ft.Colors.RED
+                lbl_sensor.value = "Sonda: OK" if sensor_connected else "Sonda: OFF"
 
-            # 2. Valores del Sistema
+                # LÓGICA DE BLOQUEO UI
+                controls_enabled = (relay_connected and sensor_connected)
+                sw_mode.disabled = not controls_enabled
+                btn_plus.disabled = not controls_enabled
+                btn_minus.disabled = not controls_enabled
+                
+                if not relay_connected:
+                    card_status.bgcolor = ft.Colors.RED_900
+                    card_status.content.value = "⚠️ RELÉ OFF"
+                    card_status.content.color = ft.Colors.WHITE
+                    card_status.border = ft.border.all(2, ft.Colors.RED)
+                
+                elif not sensor_connected:
+                    card_status.bgcolor = ft.Colors.ORANGE_900
+                    card_status.content.value = "⚠️ SONDA OFF"
+                    card_status.content.color = ft.Colors.WHITE
+                    card_status.border = ft.border.all(2, ft.Colors.ORANGE)
+
+            # 2. Valores del Sistema (Solo actualizar si Relé está vivo, o solo info visual)
             mode = sys_state.get("mode")
             relay_on = sys_state.get("relay_state") == "ON"
             curr = sys_state.get("current_temp")
             tgt = sys_state.get("target_temp")
 
-            if mode:
+            if mode and relay_connected: # Solo aceptamos "verdad" de modo si el relé está conectado
                 if mode != current_mode:
                     current_mode = mode
                     sw_mode.value = (mode == "AUTO")
@@ -231,17 +241,18 @@ def main(page: ft.Page):
                 txt_current_temp.value = "--.-°C"
                 txt_current_temp.color = ft.Colors.GREY
 
-            # 3. Estado Visual Caldera
-            if relay_on:
-                card_status.bgcolor = ft.Colors.ORANGE_900
-                card_status.content.value = "🔥 CALENTANDO"
-                card_status.content.color = ft.Colors.ORANGE
-                card_status.border = ft.border.all(2, ft.Colors.ORANGE)
-            else:
-                card_status.bgcolor = ft.Colors.GREY_900
-                card_status.content.value = "❄️ EN REPOSO"
-                card_status.content.color = ft.Colors.GREY
-                card_status.border = None
+            # 3. Estado Visual Caldera (Solo si Relé conectado)
+            if relay_connected:
+                if relay_on:
+                    card_status.bgcolor = ft.Colors.ORANGE_900
+                    card_status.content.value = "🔥 CALENTANDO"
+                    card_status.content.color = ft.Colors.ORANGE
+                    card_status.border = ft.border.all(2, ft.Colors.ORANGE)
+                else:
+                    card_status.bgcolor = ft.Colors.GREY_900
+                    card_status.content.value = "❄️ EN REPOSO"
+                    card_status.content.color = ft.Colors.GREY
+                    card_status.border = None
 
             page.update()
 

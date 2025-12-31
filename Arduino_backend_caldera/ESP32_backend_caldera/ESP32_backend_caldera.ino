@@ -186,6 +186,7 @@ void handleMessage(uint8_t *payload) {
   }
 
   else if (strcmp(type, "ping") == 0) {
+    Serial.println("🏓 PING recibido del Backend"); // Heartbeat explícito
     webSocket.sendTXT("{\"type\":\"pong\"}");
   }
 }
@@ -248,13 +249,13 @@ void loop() {
     runControlLogic();
   }
 
-  // DEBUG & HEARTBEAT DE ESTADO (CADA 30 SEGUNDOS)
+  // DEBUG & HEARTBEAT DE ESTADO (CADA 5 SEGUNDOS)
   static unsigned long lastDebug = 0;
-  if (millis() - lastDebug > 30000) {
+  if (millis() - lastDebug > 5000) {
     lastDebug = millis();
 
     // 1. Log Local
-    Serial.printf("🔍 [ESTADO 30s] Relé: %s | Modo: %s | Sonda: %.2f C | "
+    Serial.printf("🔍 [ESTADO 5s] Relé: %s | Modo: %s | Sonda: %.2f C | "
                   "Target: %.2f C\n",
                   relayState ? "ON" : "OFF",
                   currentMode == MODE_AUTO ? "AUTO" : "MANUAL",
