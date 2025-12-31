@@ -212,8 +212,67 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 // -----------------------------------------------------------------------------
 // 🚀 SETUP
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// 🛠️ UTILS: WiFi & NTP
+// -----------------------------------------------------------------------------
+String local_ip_str() {
+  IPAddress ip = WiFi.localIP();
+  return String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." +
+         String(ip[3]);
+}
+
+bool connect_wifi_one(const char *ssid, const char *pass,
+                      uint16_t timeout_ms = 15000) {
+  Serial.printf("📶 Conectando a WiFi: %s ...\n", ssid);
+  WiFi.begin(ssid, pass);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("✅ WiFi OK (%s) — IP: %s\n", ssid, local_ip_str().c_str());
+    return true;
+  }
+  Serial.printf("❌ No fue posible conectar a %s\n", ssid);
+  return false;
+}
+
+void connect_wifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
+  // Intento 1: Principal
+  if (connect_wifi_one(WIFI1_SSID, WIFI1_PASS))
+    return;
+  // Intento 2: Fallback
+  connect_wifi_one(WIFI2_SSID, WIFI2_PASS);
+}
+
+void sync_time_once() {
+  // Configuración de zona horaria desde config.h
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org",
+             "time.nist.gov");
+
+  Serial.print("🕒 Sincronizando hora NTP");
+  struct tm tm_info;
+  // Intentar sincronizar durante 10 segundos
+  if (getLocalTime(&tm_info, 10000)) {
+    Serial.println("\n✅ Hora sincronizada correctamente.");
+  } else {
+    Serial.println("\n⚠️ No se pudo sincronizar la hora (continuando...)");
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 🚀 SETUP
+// -----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  delay(500); // Pequeña pausa inicial
+
   EEPROM.begin(EEPROM_SIZE);
 
   pinMode(RELE_PIN, OUTPUT);
@@ -222,19 +281,22 @@ void setup() {
   pixels.begin();
   setNeoPixelMirror(false);
 
-  WiFi.begin(CASA_SSID, CASA_PASS);
-  Serial.print("Conectando WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\n✅ WiFi OK IP: %s\n", WiFi.localIP().toString().c_str());
+  // 1. Conexión WiFi Robusta (con fallback)
+  connect_wifi();
 
-#if (MODO_PRODUCCION == 1)
-  webSocket.beginSSL(WEBSOCKET_HOST, WEBSOCKET_PORT, WEBSOCKET_PATH);
+  // 2. Sincronización NTP (Crítico para SSL)
+  sync_time_once();
+
+  // 3. Inicialización WebSocket
+  Serial.printf("🔗 Conectando al Servidor: %s:%d%s (SSL=%d)\n", WS_HOST,
+                WS_PORT, WS_PATH, WS_SECURE);
+
+#if WS_SECURE
+  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
 #else
-  webSocket.begin(WEBSOCKET_HOST, WEBSOCKET_PORT, WEBSOCKET_PATH);
+  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
 #endif
+
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
   webSocket.enableHeartbeat(15000, 3000, 2);
